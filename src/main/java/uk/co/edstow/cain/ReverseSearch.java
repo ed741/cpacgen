@@ -228,6 +228,7 @@ public class ReverseSearch<G extends Goal<G>, T extends Transformation<R>, R ext
     private final int goalReductionsPerStep;
     private final int goalReductionsTolerance;
 
+    private final Object workMonitor = new Object();
 
     public ReverseSearch(List<G> initialGoals, List<G> finalGoals, Generator<G,T,R> generator, RunConfig<G,T,R> runConfig, RegisterAllocator<G,T,R> registerAllocator) {
         this.liveCounter = runConfig.liveCounter;
@@ -409,7 +410,9 @@ public class ReverseSearch<G extends Goal<G>, T extends Transformation<R>, R ext
                     }
                     endTime();
                 }
-                if(workersFinished.tryAcquire()){
+
+                boolean allSleeping = workersThreads.stream().noneMatch(w -> w.active);
+                if(workersFinished.tryAcquire() || allSleeping){
                     workersFinished.release();
                     if(!quiet) {
                         System.out.println("\nWorkers Are finished");
@@ -488,12 +491,25 @@ public class ReverseSearch<G extends Goal<G>, T extends Transformation<R>, R ext
         }
 
         private WorkState<G,T,R> stealWork() throws InterruptedException {
-            Worker c = next;
             WorkState<G,T,R> s = null;
-            while (s==null){
-                s = localTraversalSystem.steal(c.localTraversalSystem);
-                c = c.next;
-            }
+                while (true) {
+
+                    for (Worker c = next; c.id != id && s == null; c = c.next) {
+                        s = localTraversalSystem.steal(c.localTraversalSystem);
+                    }
+
+                    if (s != null)
+                        break;
+
+                    synchronized (workMonitor) {
+                        try {
+                            active = false;
+                            workMonitor.wait();
+                            active = true;
+                        } catch (InterruptedException ignored) {}
+                    }
+                }
+
             steals++;
             return s;
         }
@@ -604,7 +620,9 @@ public class ReverseSearch<G extends Goal<G>, T extends Transformation<R>, R ext
             }
             WorkState<G,T,R> next = new WorkState<>(depth, goals, currentPlan, goalPairs);
             localTraversalSystem.add(child, next);
-
+            synchronized (workMonitor) {
+                workMonitor.notifyAll();
+            }
         }
 
         private boolean tryDirectSolve(int depth, GoalBag<G> goals, Plan<G,T,R> currentPlan) {
